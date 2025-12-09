@@ -18,7 +18,8 @@ def compute_class_weights(labels, device='cpu'):
         device (str): Device to place the weights tensor on ('cpu' or 'cuda')
     
     Returns:
-        torch.Tensor: Class weights tensor of shape [num_classes]
+        torch.Tensor: Class weights tensor of shape [max_class_label + 1].
+            For non-contiguous labels, missing class indices are set to 1.0 (neutral weight).
     
     Example:
         # Collect all training labels
@@ -49,13 +50,14 @@ def compute_class_weights(labels, device='cpu'):
     weights = total_samples / (num_classes * counts)
     
     # Normalize weights to sum to num_classes
-    # This keeps the overall loss magnitude similar to the unweighted case
+    # This maintains relative class importance while keeping loss scale stable
     weights = weights * (num_classes / weights.sum())
     
     # Create tensor with weights in proper class order
     # Handle non-contiguous class labels by creating appropriately sized tensor
+    # Set missing class indices to 1.0 (neutral weight) instead of 0
     max_class = int(classes.max())
-    class_weights = torch.zeros(max_class + 1, dtype=torch.float32)
+    class_weights = torch.ones(max_class + 1, dtype=torch.float32)
     for idx, cls in enumerate(classes):
         class_weights[int(cls)] = weights[idx]
     
