@@ -477,7 +477,10 @@ def compute_class_weights(labels, device='cpu'):
     weights = total_samples / (num_classes * counts)
     
     # Normalize weights to sum to num_classes
-    # This maintains relative class importance while keeping loss scale stable
+    # This maintains relative class importance while keeping loss scale stable.
+    # Without normalization, loss magnitude could vary significantly with dataset size,
+    # requiring learning rate adjustments. Normalization preserves relative weights
+    # while ensuring consistent loss scale across different dataset sizes.
     weights = weights * (num_classes / weights.sum())
     
     # Create tensor with weights in proper class order
@@ -513,7 +516,7 @@ def train_epoch_with_gaze(model, train_loader, optimizer, device, gaze_weight=0.
     correct = total = 0
     batches_with_gaze = samples_with_gaze = 0
     
-    # Move class_weights to device if provided
+    # Move class_weights to device if provided (no-op if already on device)
     if class_weights is not None:
         class_weights = class_weights.to(device)
 
