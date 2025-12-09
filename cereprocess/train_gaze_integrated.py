@@ -8,6 +8,55 @@ import os
 from tqdm import tqdm
 import json
 
+def compute_class_weights(labels, device='cpu'):
+    """
+    Compute class weights for handling class imbalance.
+    Classes with fewer samples will get higher weights.
+    
+    Args:
+        labels (array-like): All training labels (list, numpy array, or tensor)
+        device (str): Device to place the weights tensor on ('cpu' or 'cuda')
+    
+    Returns:
+        torch.Tensor: Class weights tensor of shape [num_classes]
+    
+    Example:
+        # Collect all training labels
+        all_labels = []
+        for batch in train_loader:
+            all_labels.extend(batch['label'].numpy())
+        
+        # Compute balanced weights
+        class_weights = compute_class_weights(all_labels, device='cuda')
+        
+        # Use with GazeGuidedLoss
+        criterion = GazeGuidedLoss(class_weights=class_weights)
+    """
+    # Convert to numpy array if needed
+    if isinstance(labels, torch.Tensor):
+        labels = labels.cpu().numpy()
+    elif isinstance(labels, list):
+        labels = np.array(labels)
+    
+    # Get unique classes and their counts
+    classes, counts = np.unique(labels, return_counts=True)
+    
+    # Compute weights: inversely proportional to class frequency
+    # weight = total_samples / (num_classes * class_count)
+    total_samples = len(labels)
+    num_classes = len(classes)
+    weights = total_samples / (num_classes * counts)
+    
+    # Normalize weights so they sum to num_classes (optional, for stability)
+    weights = weights * (num_classes / weights.sum())
+    
+    # Create tensor with weights in proper class order
+    class_weights = torch.zeros(num_classes, dtype=torch.float32)
+    for idx, cls in enumerate(classes):
+        class_weights[int(cls)] = weights[idx]
+    
+    return class_weights.to(device)
+
 class GazeGuidedLoss(nn.Module):
     """
     Loss function for gaze-guided training
@@ -19,6 +68,7 @@ class GazeGuidedLoss(nn.Module):
         class_weights (torch.Tensor, optional): Weights for each class to handle class imbalance.
             Should be a 1D tensor of shape [num_classes] with positive values.
             Higher values give more importance to the corresponding class.
+            Use compute_class_weights() function to automatically calculate balanced weights.
             If None, all classes are weighted equally (default: None)
     """
     def __init__(self, cls_weight=1.0, gaze_weight=0.3, class_weights=None):
@@ -122,8 +172,8 @@ def train_gaze_guided_your_pipeline(model, train_loader, eval_loader, optimizer,
         save_best_acc (bool): Whether to save best accuracy model (default: False)
         gaze_weight (float): Weight for gaze alignment loss (default: 0.3)
         class_weights (torch.Tensor, optional): Weights for each class to handle class imbalance.
-            Should be a 1D tensor of shape [num_classes]. Use sklearn.utils.class_weight.compute_class_weight
-            to compute balanced weights from training labels (default: None)
+            Should be a 1D tensor of shape [num_classes]. Use the compute_class_weights() function
+            to automatically compute balanced weights from training labels (default: None)
     """
     model = model.to(device)
     
