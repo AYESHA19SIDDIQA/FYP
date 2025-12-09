@@ -12,6 +12,14 @@ class GazeGuidedLoss(nn.Module):
     """
     Loss function for gaze-guided training
     Combines classification loss with gaze alignment loss
+    
+    Args:
+        cls_weight (float): Weight for classification loss component (default: 1.0)
+        gaze_weight (float): Weight for gaze alignment loss component (default: 0.3)
+        class_weights (torch.Tensor, optional): Weights for each class to handle class imbalance.
+            Should be a 1D tensor of shape [num_classes] with positive values.
+            Higher values give more importance to the corresponding class.
+            If None, all classes are weighted equally (default: None)
     """
     def __init__(self, cls_weight=1.0, gaze_weight=0.3, class_weights=None):
         super(GazeGuidedLoss, self).__init__()
@@ -96,6 +104,26 @@ def train_gaze_guided_your_pipeline(model, train_loader, eval_loader, optimizer,
                                    gaze_weight=0.3, class_weights=None):
     """
     Modified version of your train() function that includes gaze guidance
+    
+    Args:
+        model: Neural network model
+        train_loader: DataLoader for training data
+        eval_loader: DataLoader for evaluation data
+        optimizer: Optimizer for training
+        criterion: Loss criterion (not used, gaze_criterion created internally)
+        epochs: Number of training epochs
+        history: History object to track metrics
+        metrics: Metrics object to compute evaluation metrics
+        device: Device to run training on ('cuda' or 'cpu')
+        save_path: Path to save model checkpoints
+        earlystopping: EarlyStopping object for early stopping
+        accum_iter (int): Gradient accumulation iterations (default: 1)
+        scheduler: Learning rate scheduler (optional)
+        save_best_acc (bool): Whether to save best accuracy model (default: False)
+        gaze_weight (float): Weight for gaze alignment loss (default: 0.3)
+        class_weights (torch.Tensor, optional): Weights for each class to handle class imbalance.
+            Should be a 1D tensor of shape [num_classes]. Use sklearn.utils.class_weight.compute_class_weight
+            to compute balanced weights from training labels (default: None)
     """
     model = model.to(device)
     
