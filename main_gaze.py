@@ -34,7 +34,14 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
-from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix
+
+# Try to import sklearn metrics, fallback to manual implementation if not available
+try:
+    from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    print("Warning: sklearn not available, using manual metric implementations")
 
 # Project path
 sys.path.append('.')
@@ -614,6 +621,45 @@ def compute_gaze_attention_loss(attention_map, gaze, labels, loss_type='mse'):
         raise ValueError("Unknown gaze loss type")
 
 
+def manual_confusion_matrix(labels, preds, num_classes=2):
+    """Manual implementation of confusion matrix."""
+    conf_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for true, pred in zip(labels, preds):
+        if 0 <= true < num_classes and 0 <= pred < num_classes:
+            conf_matrix[int(true), int(pred)] += 1
+    return conf_matrix
+
+
+def manual_precision_recall_f1(labels, preds, num_classes=2):
+    """Manual implementation of precision, recall, and F1 score."""
+    labels = np.array(labels)
+    preds = np.array(preds)
+    
+    precision_per_class = np.zeros(num_classes)
+    recall_per_class = np.zeros(num_classes)
+    f1_per_class = np.zeros(num_classes)
+    
+    for cls in range(num_classes):
+        # True positives, false positives, false negatives
+        tp = np.sum((preds == cls) & (labels == cls))
+        fp = np.sum((preds == cls) & (labels != cls))
+        fn = np.sum((preds != cls) & (labels == cls))
+        
+        # Precision: TP / (TP + FP)
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        precision_per_class[cls] = precision
+        
+        # Recall: TP / (TP + FN)
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        recall_per_class[cls] = recall
+        
+        # F1: 2 * (precision * recall) / (precision + recall)
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+        f1_per_class[cls] = f1
+    
+    return precision_per_class, recall_per_class, f1_per_class
+
+
 def compute_per_class_metrics(labels, preds, num_classes=2):
     """
     Compute per-class precision, recall, and F1 scores.
@@ -632,18 +678,29 @@ def compute_per_class_metrics(labels, preds, num_classes=2):
     if isinstance(preds, torch.Tensor):
         preds = preds.cpu().numpy()
     
-    # Compute metrics for each class
-    precision_per_class = precision_score(labels, preds, average=None, zero_division=0)
-    recall_per_class = recall_score(labels, preds, average=None, zero_division=0)
-    f1_per_class = f1_score(labels, preds, average=None, zero_division=0)
+    labels = np.array(labels)
+    preds = np.array(preds)
     
-    # Compute macro averages
-    macro_precision = precision_score(labels, preds, average='macro', zero_division=0)
-    macro_recall = recall_score(labels, preds, average='macro', zero_division=0)
-    macro_f1 = f1_score(labels, preds, average='macro', zero_division=0)
-    
-    # Compute confusion matrix
-    conf_matrix = confusion_matrix(labels, preds)
+    if SKLEARN_AVAILABLE:
+        # Use sklearn if available
+        precision_per_class = precision_score(labels, preds, average=None, zero_division=0)
+        recall_per_class = recall_score(labels, preds, average=None, zero_division=0)
+        f1_per_class = f1_score(labels, preds, average=None, zero_division=0)
+        
+        macro_precision = precision_score(labels, preds, average='macro', zero_division=0)
+        macro_recall = recall_score(labels, preds, average='macro', zero_division=0)
+        macro_f1 = f1_score(labels, preds, average='macro', zero_division=0)
+        
+        conf_matrix = confusion_matrix(labels, preds)
+    else:
+        # Use manual implementation
+        precision_per_class, recall_per_class, f1_per_class = manual_precision_recall_f1(labels, preds, num_classes)
+        
+        macro_precision = np.mean(precision_per_class)
+        macro_recall = np.mean(recall_per_class)
+        macro_f1 = np.mean(f1_per_class)
+        
+        conf_matrix = manual_confusion_matrix(labels, preds, num_classes)
     
     metrics = {
         'precision_per_class': precision_per_class,
