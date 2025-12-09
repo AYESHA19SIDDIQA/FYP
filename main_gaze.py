@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 """
-Updated training script with robust on-disk -> dataset matching and improved debugging.
+Updated training script with robust on-disk -> dataset matching and class imbalance handling.
 
-Key fixes:
+Key Features:
 - Recursive on-disk discovery of .npz and .json files (os.walk).
 - Case-insensitive, normalized basename matching (optional suffix stripping).
 - Probe dataset samples for 'file' entries and normalize them the same way.
 - Filter datasets by dataset indices whose normalized basename appears in the on-disk matched set.
 - Attach gaze_json_dir metadata to Subset objects so downstream code can access it.
 - Many clear debug prints and diagnostic helpers to explain differences (e.g. "23 vs 8").
+
+Class Imbalance Improvements:
+- Batch balancing: WeightedRandomSampler ensures minority samples in each batch
+- Per-class F1 score tracking: Monitors F1 for each class during training
+- Label smoothing: Reduces overconfidence in majority class predictions
+- Smaller learning rate + longer training: Better minority class learning
+- Macro-F1 early stopping: Uses macro-F1 instead of accuracy (more balanced metric)
+- Comprehensive metrics: Precision, recall, F1 per class, confusion matrix
+- Class weights: Weighted loss function to handle imbalance
+- Extended patience: Allows more time for minority class learning
 
 Usage: replace your previous training script with this file (or import helper classes/functions).
 """
@@ -24,6 +34,14 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
+
+# Try to import sklearn metrics, fallback to manual implementation if not available
+try:
+    from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    print("Warning: sklearn not available, using manual metric implementations")
 
 # Project path
 sys.path.append('.')
@@ -357,10 +375,61 @@ class DataDebugger:
 # ----------------- Dataloader builder using Filtered wrapper -----------------
 
 
+def create_balanced_sampler(dataset, batch_size, minority_per_batch=2):
+    """
+    Create a WeightedRandomSampler that increases probability of minority samples in batches.
+    
+    Args:
+        dataset: Dataset to sample from
+        batch_size: Batch size
+        minority_per_batch: Target number of minority samples per batch (guidance, not guaranteed)
+                           Due to probabilistic sampling, actual counts will vary
+        
+    Returns:
+        WeightedRandomSampler instance
+    """
+    # Get all labels from dataset
+    # Note: This iterates through the dataset once. For large datasets, consider
+    # caching labels or using dataset.targets if available
+    all_labels = []
+    for i in range(len(dataset)):
+        sample = dataset[i]
+        if isinstance(sample, dict):
+            label = sample['label'].item() if isinstance(sample['label'], torch.Tensor) else sample['label']
+        else:
+            label = sample[1] if len(sample) > 1 else 0
+        all_labels.append(label)
+    
+    # Count samples per class
+    labels_array = np.array(all_labels)
+    class_counts = np.bincount(labels_array)
+    
+    # Compute sample weights: inversely proportional to class frequency
+    # This ensures minority samples are more likely to be selected
+    class_weights = 1.0 / class_counts
+    sample_weights = class_weights[labels_array]
+    
+    # Create sampler
+    sampler = torch.utils.data.WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True
+    )
+    
+    print(f"\n  Balanced Sampler Statistics:")
+    print(f"    Class counts: {class_counts}")
+    print(f"    Class weights: {class_weights}")
+    print(f"    Note: WeightedRandomSampler uses probabilistic sampling")
+    print(f"    Expected increase in minority samples per batch (not guaranteed)")
+    
+    return sampler
+
+
 def get_dataloaders_fixed(datadir, batch_size, seed,
                           target_length=None, indexes=None,
                           gaze_json_dir=None, only_matched=True,
-                          suffixes_to_strip=None, **kwargs):
+                          suffixes_to_strip=None, use_balanced_sampling=False, 
+                          minority_per_batch=2, **kwargs):
     """
     Build dataloaders using FilteredEEGGazeFixationDataset to ensure only
     on-disk matched EEG<->JSON pairs are used.
@@ -408,11 +477,19 @@ def get_dataloaders_fixed(datadir, batch_size, seed,
     # Create DataLoaders
     def worker_init_fn(worker_id):
         np.random.seed(seed + worker_id)
+    
+    # Create balanced sampler for training if requested
+    train_sampler = None
+    shuffle_train = True
+    if use_balanced_sampling and len(trainset) > 0:
+        train_sampler = create_balanced_sampler(trainset, batch_size, minority_per_batch)
+        shuffle_train = False  # Sampler and shuffle are mutually exclusive
 
     train_loader = torch.utils.data.DataLoader(
         trainset,
         batch_size=min(batch_size, len(trainset)) if len(trainset) > 0 else 1,
-        shuffle=True,
+        shuffle=shuffle_train,
+        sampler=train_sampler,
         num_workers=0,
         worker_init_fn=worker_init_fn,
         pin_memory=torch.cuda.is_available(),
@@ -492,6 +569,51 @@ def compute_class_weights(labels, device='cpu'):
     return class_weights.to(device)
 
 
+class LabelSmoothingCrossEntropy(torch.nn.Module):
+    """
+    Label smoothing cross-entropy loss.
+    Reduces overconfidence by distributing some probability mass to other classes.
+    Particularly useful for majority classes to prevent overfitting.
+    """
+    def __init__(self, smoothing=0.1, weight=None):
+        super().__init__()
+        self.smoothing = smoothing
+        self.weight = weight
+    
+    def forward(self, logits, target):
+        """
+        Args:
+            logits: Predicted logits (batch_size, num_classes)
+            target: Ground truth labels (batch_size,)
+        """
+        num_classes = logits.size(-1)
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        # Validate target values are within valid range
+        max_target = target.max().item()
+        min_target = target.min().item()
+        if max_target >= num_classes:
+            raise ValueError(f"Target contains invalid class index: {max_target} >= {num_classes}")
+        if min_target < 0:
+            raise ValueError(f"Target contains negative class index: {min_target}")
+        
+        # Apply smoothing
+        with torch.no_grad():
+            # Create one-hot encoding
+            true_dist = torch.zeros_like(log_probs)
+            true_dist.fill_(self.smoothing / (num_classes - 1))
+            true_dist.scatter_(1, target.unsqueeze(1), 1.0 - self.smoothing)
+        
+        # Apply class weights if provided
+        if self.weight is not None:
+            # Weight each sample by its class weight
+            sample_weights = self.weight[target]
+            loss = -(true_dist * log_probs).sum(dim=-1) * sample_weights
+            return loss.mean()
+        else:
+            return -(true_dist * log_probs).sum(dim=-1).mean()
+
+
 def compute_gaze_attention_loss(attention_map, gaze, labels, loss_type='mse'):
     if loss_type == 'mse':
         return F.mse_loss(attention_map, gaze)
@@ -510,15 +632,120 @@ def compute_gaze_attention_loss(attention_map, gaze, labels, loss_type='mse'):
         raise ValueError("Unknown gaze loss type")
 
 
-def train_epoch_with_gaze(model, train_loader, optimizer, device, gaze_weight=0.1, gaze_loss_type='mse', class_weights=None):
+def manual_confusion_matrix(labels, preds, num_classes=2):
+    """Manual implementation of confusion matrix."""
+    conf_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for true, pred in zip(labels, preds):
+        if 0 <= true < num_classes and 0 <= pred < num_classes:
+            conf_matrix[int(true), int(pred)] += 1
+    return conf_matrix
+
+
+def manual_precision_recall_f1(labels, preds, num_classes=2):
+    """Manual implementation of precision, recall, and F1 score."""
+    labels = np.array(labels)
+    preds = np.array(preds)
+    
+    precision_per_class = np.zeros(num_classes)
+    recall_per_class = np.zeros(num_classes)
+    f1_per_class = np.zeros(num_classes)
+    
+    for cls in range(num_classes):
+        # True positives, false positives, false negatives
+        tp = np.sum((preds == cls) & (labels == cls))
+        fp = np.sum((preds == cls) & (labels != cls))
+        fn = np.sum((preds != cls) & (labels == cls))
+        
+        # Precision: TP / (TP + FP)
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        precision_per_class[cls] = precision
+        
+        # Recall: TP / (TP + FN)
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        recall_per_class[cls] = recall
+        
+        # F1: 2 * (precision * recall) / (precision + recall)
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+        f1_per_class[cls] = f1
+    
+    return precision_per_class, recall_per_class, f1_per_class
+
+
+def compute_per_class_metrics(labels, preds, num_classes=2):
+    """
+    Compute per-class precision, recall, and F1 scores.
+    
+    Args:
+        labels: Ground truth labels (numpy array or list)
+        preds: Predicted labels (numpy array or list)
+        num_classes: Number of classes
+        
+    Returns:
+        dict: Dictionary containing per-class metrics
+    """
+    # Ensure numpy arrays
+    if isinstance(labels, torch.Tensor):
+        labels = labels.cpu().numpy()
+    if isinstance(preds, torch.Tensor):
+        preds = preds.cpu().numpy()
+    
+    labels = np.array(labels)
+    preds = np.array(preds)
+    
+    if SKLEARN_AVAILABLE:
+        # Use sklearn if available
+        precision_per_class = precision_score(labels, preds, average=None, zero_division=0)
+        recall_per_class = recall_score(labels, preds, average=None, zero_division=0)
+        f1_per_class = f1_score(labels, preds, average=None, zero_division=0)
+        
+        macro_precision = precision_score(labels, preds, average='macro', zero_division=0)
+        macro_recall = recall_score(labels, preds, average='macro', zero_division=0)
+        macro_f1 = f1_score(labels, preds, average='macro', zero_division=0)
+        
+        conf_matrix = confusion_matrix(labels, preds)
+    else:
+        # Use manual implementation
+        precision_per_class, recall_per_class, f1_per_class = manual_precision_recall_f1(labels, preds, num_classes)
+        
+        macro_precision = np.mean(precision_per_class)
+        macro_recall = np.mean(recall_per_class)
+        macro_f1 = np.mean(f1_per_class)
+        
+        conf_matrix = manual_confusion_matrix(labels, preds, num_classes)
+    
+    metrics = {
+        'precision_per_class': precision_per_class,
+        'recall_per_class': recall_per_class,
+        'f1_per_class': f1_per_class,
+        'macro_precision': macro_precision,
+        'macro_recall': macro_recall,
+        'macro_f1': macro_f1,
+        'confusion_matrix': conf_matrix
+    }
+    
+    return metrics
+
+
+def train_epoch_with_gaze(model, train_loader, optimizer, device, gaze_weight=0.1, gaze_loss_type='mse', 
+                         class_weights=None, label_smoothing=0.0, use_label_smoothing=False):
     model.train()
     total_loss = total_cls = total_gaze = 0.0
     correct = total = 0
     batches_with_gaze = samples_with_gaze = 0
     
+    # Track predictions and labels for per-class metrics
+    all_preds = []
+    all_labels = []
+    
     # Move class_weights to device if provided (no-op if already on device)
     if class_weights is not None:
         class_weights = class_weights.to(device)
+    
+    # Initialize loss function with label smoothing if requested
+    if use_label_smoothing and label_smoothing > 0:
+        criterion = LabelSmoothingCrossEntropy(smoothing=label_smoothing, weight=class_weights)
+    else:
+        criterion = None
 
     pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc="Training")
     for batch_idx, batch in pbar:
@@ -544,12 +771,6 @@ def train_epoch_with_gaze(model, train_loader, optimizer, device, gaze_weight=0.
             batches_with_gaze += 1
             samples_with_gaze += eeg.shape[0]
 
-        # debug print for first two samples in batch
-        debug_lines = []
-        # for i, fname in enumerate(batch_files[:2]):
-        #     debug_lines.append(f"[B{batch_idx} S{i}] {fname}")
-        # print(f"\n[TRAIN] Batch {batch_idx+1}/{len(train_loader)} | " + "; ".join(debug_lines))
-
         # forward
         if has_gaze:
             outputs = model(eeg, return_attention=True)
@@ -562,11 +783,14 @@ def train_epoch_with_gaze(model, train_loader, optimizer, device, gaze_weight=0.
             logits = model(eeg, return_attention=False)
             attention_map = None
 
-        # classification loss with class weights
-        if class_weights is not None:
+        # classification loss with class weights and optional label smoothing
+        if criterion is not None:
+            cls_loss = criterion(logits, labels)
+        elif class_weights is not None:
             cls_loss = F.cross_entropy(logits, labels, weight=class_weights)
         else:
             cls_loss = F.cross_entropy(logits, labels)
+            
         if has_gaze and attention_map is not None:
             gaze_loss = compute_gaze_attention_loss(attention_map, gaze, labels, gaze_loss_type)
             loss = cls_loss + gaze_weight * gaze_loss
@@ -586,6 +810,10 @@ def train_epoch_with_gaze(model, train_loader, optimizer, device, gaze_weight=0.
         preds = torch.argmax(logits, dim=1)
         correct += (preds == labels).sum().item()
         total += labels.size(0)
+        
+        # Track for per-class metrics
+        all_preds.extend(preds.cpu().numpy().tolist())
+        all_labels.extend(labels.cpu().numpy().tolist())
 
         pbar.set_postfix({'loss': f"{loss.item():.4f}", 'acc': f"{correct/total*100:.1f}%"})
 
@@ -593,6 +821,9 @@ def train_epoch_with_gaze(model, train_loader, optimizer, device, gaze_weight=0.
     avg_cls = total_cls / max(len(train_loader), 1)
     avg_gaze = total_gaze / max(len(train_loader), 1)
     acc = correct / total * 100 if total > 0 else 0.0
+    
+    # Compute per-class metrics
+    metrics = compute_per_class_metrics(all_labels, all_preds)
 
     gaze_stats = {
         'batches_with_gaze': batches_with_gaze,
@@ -600,10 +831,25 @@ def train_epoch_with_gaze(model, train_loader, optimizer, device, gaze_weight=0.
         'total_batches': len(train_loader),
         'total_samples': total
     }
-    return avg_loss, avg_cls, avg_gaze, acc, gaze_stats
+    return avg_loss, avg_cls, avg_gaze, acc, gaze_stats, metrics
 
 
-def evaluate_model(model, eval_loader, device):
+def evaluate_model(model, eval_loader, device, compute_metrics=True):
+    """
+    Evaluate model on validation/test set with comprehensive metrics.
+    
+    Args:
+        model: The neural network model
+        eval_loader: DataLoader for evaluation
+        device: Device to run on
+        compute_metrics: Whether to compute per-class metrics
+        
+    Returns:
+        acc: Overall accuracy
+        all_labels: All ground truth labels
+        all_preds: All predicted labels
+        metrics: Dictionary of per-class metrics (if compute_metrics=True)
+    """
     model.eval()
     correct = total = 0
     all_labels = []
@@ -619,7 +865,12 @@ def evaluate_model(model, eval_loader, device):
             all_labels.extend(labels.cpu().numpy().tolist())
             all_preds.extend(preds.cpu().numpy().tolist())
     acc = correct / total * 100 if total > 0 else 0.0
-    return acc, all_labels, all_preds
+    
+    metrics = None
+    if compute_metrics:
+        metrics = compute_per_class_metrics(all_labels, all_preds)
+    
+    return acc, all_labels, all_preds, metrics
 
 
 # ----------------- Main -----------------
@@ -653,8 +904,47 @@ def main():
         data_dir = "./preprocessed_data"
         data_description = {'channel_no': 22, 'sampling_rate': 100, 'time_span': 300}
 
+    # ========================================================================
+    # CONFIGURATION SECTION - Adjust these parameters for your dataset
+    # ========================================================================
+    
+    # Data configuration
     gaze_json_dir = "results/gaze"
-    hyps = def_hyp(batch_size=16, epochs=15, lr=1e-4, accum_iter=2)
+    
+    # Training hyperparameters optimized for class imbalance
+    # Smaller learning rate for better minority class learning
+    BATCH_SIZE = 16
+    EPOCHS = 30
+    LEARNING_RATE = 5e-5
+    ACCUM_ITER = 2
+    
+    # Class imbalance handling configuration
+    USE_BALANCED_SAMPLING = True  # Batch balancing with WeightedRandomSampler
+    MINORITY_PER_BATCH = 2  # Target minority samples per batch (guidance, not guaranteed)
+    USE_LABEL_SMOOTHING = True  # Label smoothing for majority class
+    LABEL_SMOOTHING = 0.1  # Smoothing factor (0.0 = none, 0.5 = aggressive)
+    USE_MACRO_F1_STOPPING = True  # Use macro-F1 instead of accuracy for early stopping
+    EARLY_STOP_PATIENCE = 10  # Epochs to wait before early stopping
+    SCHEDULER_PATIENCE = 5  # Epochs to wait before reducing learning rate
+    SCHEDULER_FACTOR = 0.5  # Factor to reduce learning rate by
+    
+    # Gaze attention configuration
+    GAZE_WEIGHT = 0.1  # Weight for gaze attention loss
+    GAZE_LOSS_TYPE = 'mse'  # Type of gaze loss: 'mse', 'weighted_mse', 'cosine', 'kl'
+    
+    # Diagnostic configuration
+    DIAGNOSTIC_FREQUENCY = 10  # Run full diagnostic analysis every N epochs (0 to disable)
+    
+    # ========================================================================
+    
+    hyps = def_hyp(batch_size=BATCH_SIZE, epochs=EPOCHS, lr=LEARNING_RATE, accum_iter=ACCUM_ITER)
+    
+    # Use configuration variables
+    use_balanced_sampling = USE_BALANCED_SAMPLING
+    minority_per_batch = MINORITY_PER_BATCH
+    use_label_smoothing = USE_LABEL_SMOOTHING
+    label_smoothing = LABEL_SMOOTHING
+    use_macro_f1_stopping = USE_MACRO_F1_STOPPING
 
     # Build dataloaders (fixed)
     try:
@@ -666,7 +956,9 @@ def main():
             gaze_json_dir=gaze_json_dir,
             only_matched=True,
             suffixes_to_strip=DEFAULT_SUFFIXES_TO_STRIP,
-            eeg_sampling_rate=50.0
+            eeg_sampling_rate=50.0,
+            use_balanced_sampling=use_balanced_sampling,
+            minority_per_batch=minority_per_batch
         )
     except Exception as e:
         print("Error building dataloaders:", e)
@@ -686,7 +978,12 @@ def main():
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=hyps['lr'])
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=2, factor=0.1)
+    
+    # Scheduler with longer patience for minority class learning
+    # Mode 'max' because we're tracking macro-F1 or accuracy (higher is better)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', patience=SCHEDULER_PATIENCE, factor=SCHEDULER_FACTOR, verbose=True
+    )
 
     # Compute class weights for handling class imbalance
     print("\nComputing class weights from training data...")
@@ -710,36 +1007,133 @@ def main():
         traceback.print_exc()
         return
 
-    # Training loop
+    # Training loop with improved metrics tracking
+    best_metric = 0.0  # Will track either accuracy or macro-F1
     best_acc = 0.0
-    history = {'train_loss': [], 'train_acc': [], 'eval_acc': []}
+    patience_counter = 0
+    early_stop_patience = EARLY_STOP_PATIENCE  # Stop if no improvement for N epochs
+    
+    history = {
+        'train_loss': [], 'train_acc': [], 'train_macro_f1': [],
+        'train_f1_per_class': [], 'eval_acc': [], 'eval_macro_f1': [],
+        'eval_f1_per_class': [], 'eval_precision_per_class': [], 
+        'eval_recall_per_class': []
+    }
+
+    print(f"\n{'='*80}")
+    print(f"TRAINING CONFIGURATION".center(80))
+    print(f"{'='*80}")
+    print(f"  Epochs: {hyps['epochs']}")
+    print(f"  Learning rate: {hyps['lr']}")
+    print(f"  Batch size: {hyps['batch_size']}")
+    print(f"  Balanced sampling: {use_balanced_sampling}")
+    print(f"  Label smoothing: {use_label_smoothing} (smoothing={label_smoothing})")
+    print(f"  Early stopping metric: {'macro-F1' if use_macro_f1_stopping else 'accuracy'}")
+    print(f"  Class weights: {class_weights}")
+    print(f"{'='*80}\n")
 
     for epoch in range(hyps['epochs']):
         DataDebugger.print_header(f"EPOCH {epoch+1}/{hyps['epochs']}", width=60, char='-')
-        tr_loss, tr_cls, tr_gaze, tr_acc, tr_stats = train_epoch_with_gaze(
-            model, train_loader, optimizer, device, gaze_weight=0.1, gaze_loss_type='mse', class_weights=class_weights
+        
+        # Train with all improvements
+        tr_loss, tr_cls, tr_gaze, tr_acc, tr_stats, tr_metrics = train_epoch_with_gaze(
+            model, train_loader, optimizer, device, 
+            gaze_weight=GAZE_WEIGHT, gaze_loss_type=GAZE_LOSS_TYPE, 
+            class_weights=class_weights,
+            label_smoothing=label_smoothing,
+            use_label_smoothing=use_label_smoothing
         )
-        ev_acc, ev_labels, ev_preds = evaluate_model(model, eval_loader, device)
-        scheduler.step(ev_acc)
+        
+        # Evaluate with comprehensive metrics
+        ev_acc, ev_labels, ev_preds, ev_metrics = evaluate_model(
+            model, eval_loader, device, compute_metrics=True
+        )
+        
+        # Get the metric to use for learning rate scheduling and early stopping
+        if use_macro_f1_stopping:
+            current_metric = ev_metrics['macro_f1']
+            scheduler.step(current_metric)
+        else:
+            current_metric = ev_acc
+            scheduler.step(ev_acc)
 
+        # Store history
         history['train_loss'].append(tr_loss)
         history['train_acc'].append(tr_acc)
+        history['train_macro_f1'].append(tr_metrics['macro_f1'])
+        history['train_f1_per_class'].append(tr_metrics['f1_per_class'].tolist())
         history['eval_acc'].append(ev_acc)
+        history['eval_macro_f1'].append(ev_metrics['macro_f1'])
+        history['eval_f1_per_class'].append(ev_metrics['f1_per_class'].tolist())
+        history['eval_precision_per_class'].append(ev_metrics['precision_per_class'].tolist())
+        history['eval_recall_per_class'].append(ev_metrics['recall_per_class'].tolist())
 
-        print(f"\nEpoch {epoch+1}: Train acc {tr_acc:.2f}% | Eval acc {ev_acc:.2f}%")
-        if ev_acc > best_acc:
+        # Print comprehensive metrics
+        print(f"\n{'='*80}")
+        print(f"EPOCH {epoch+1} RESULTS".center(80))
+        print(f"{'='*80}")
+        print(f"\nTRAINING:")
+        print(f"  Loss: {tr_loss:.4f} | Accuracy: {tr_acc:.2f}% | Macro-F1: {tr_metrics['macro_f1']:.4f}")
+        print(f"  Per-class F1 scores: {tr_metrics['f1_per_class']}")
+        print(f"  Per-class Precision: {tr_metrics['precision_per_class']}")
+        print(f"  Per-class Recall: {tr_metrics['recall_per_class']}")
+        
+        print(f"\nVALIDATION:")
+        print(f"  Accuracy: {ev_acc:.2f}% | Macro-F1: {ev_metrics['macro_f1']:.4f}")
+        print(f"  Per-class F1 scores: {ev_metrics['f1_per_class']}")
+        print(f"  Per-class Precision: {ev_metrics['precision_per_class']}")
+        print(f"  Per-class Recall: {ev_metrics['recall_per_class']}")
+        print(f"\n  Confusion Matrix:")
+        print(f"{ev_metrics['confusion_matrix']}")
+        
+        # Save best model based on chosen metric
+        if current_metric > best_metric:
+            best_metric = current_metric
             best_acc = ev_acc
-            torch.save({
-                'epoch': epoch, 'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(), 'accuracy': ev_acc
-            }, 'best_model_gaze_attention_fixed.pth')
-            print(f"Saved best model at epoch {epoch+1} (acc {ev_acc:.2f}%)")
+            patience_counter = 0
+            
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'accuracy': ev_acc,
+                'macro_f1': ev_metrics['macro_f1'],
+                'per_class_f1': ev_metrics['f1_per_class'],
+                'confusion_matrix': ev_metrics['confusion_matrix'],
+                'history': history
+            }
+            torch.save(checkpoint, 'best_model_gaze_attention_fixed.pth')
+            
+            metric_name = 'macro-F1' if use_macro_f1_stopping else 'accuracy'
+            print(f"\n✓ BEST MODEL SAVED at epoch {epoch+1}")
+            print(f"  {metric_name}: {current_metric:.4f}")
+            print(f"  Accuracy: {ev_acc:.2f}%")
+            print(f"  Per-class F1: {ev_metrics['f1_per_class']}")
+        else:
+            patience_counter += 1
+            print(f"\n  No improvement. Patience: {patience_counter}/{early_stop_patience}")
+        
+        # Early stopping
+        if patience_counter >= early_stop_patience:
+            print(f"\n{'='*80}")
+            print(f"EARLY STOPPING triggered at epoch {epoch+1}")
+            print(f"  No improvement for {early_stop_patience} epochs")
+            print(f"{'='*80}")
+            break
 
-        # Diagnostic analyze predictions if eval acc is 0
-        if ev_acc == 0 or (epoch+1) % 2 == 0:
+        # Diagnostic analyze predictions periodically (configurable frequency)
+        if DIAGNOSTIC_FREQUENCY > 0 and (ev_acc == 0 or (epoch+1) % DIAGNOSTIC_FREQUENCY == 0):
             DataDebugger.analyze_model_predictions(model, eval_loader, device, f"Epoch {epoch+1} analysis")
+        
+        print(f"{'='*80}\n")
 
-    print("\nTraining complete. Best eval acc: %.2f%%" % best_acc)
+    print("\n" + "="*80)
+    print("TRAINING COMPLETE".center(80))
+    print("="*80)
+    print(f"  Best eval accuracy: {best_acc:.2f}%")
+    print(f"  Best eval macro-F1: {best_metric:.4f}")
+    print("="*80)
+    
     np.save('training_history_fixed.npy', history)
 
 
