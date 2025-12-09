@@ -42,16 +42,20 @@ def compute_class_weights(labels, device='cpu'):
     classes, counts = np.unique(labels, return_counts=True)
     
     # Compute weights: inversely proportional to class frequency
-    # weight = total_samples / (num_classes * class_count)
+    # Formula matches sklearn's compute_class_weight with mode='balanced':
+    # weight[i] = total_samples / (num_classes * class_count[i])
     total_samples = len(labels)
     num_classes = len(classes)
     weights = total_samples / (num_classes * counts)
     
-    # Normalize weights so they sum to num_classes (optional, for stability)
+    # Normalize weights to sum to num_classes
+    # This keeps the overall loss magnitude similar to the unweighted case
     weights = weights * (num_classes / weights.sum())
     
     # Create tensor with weights in proper class order
-    class_weights = torch.zeros(num_classes, dtype=torch.float32)
+    # Handle non-contiguous class labels by creating appropriately sized tensor
+    max_class = int(classes.max())
+    class_weights = torch.zeros(max_class + 1, dtype=torch.float32)
     for idx, cls in enumerate(classes):
         class_weights[int(cls)] = weights[idx]
     
