@@ -377,17 +377,20 @@ class DataDebugger:
 
 def create_balanced_sampler(dataset, batch_size, minority_per_batch=2):
     """
-    Create a WeightedRandomSampler that ensures balanced batches with minority samples.
+    Create a WeightedRandomSampler that increases probability of minority samples in batches.
     
     Args:
         dataset: Dataset to sample from
         batch_size: Batch size
-        minority_per_batch: Minimum number of minority samples per batch
+        minority_per_batch: Target number of minority samples per batch (guidance, not guaranteed)
+                           Due to probabilistic sampling, actual counts will vary
         
     Returns:
         WeightedRandomSampler instance
     """
     # Get all labels from dataset
+    # Note: This iterates through the dataset once. For large datasets, consider
+    # caching labels or using dataset.targets if available
     all_labels = []
     for i in range(len(dataset)):
         sample = dataset[i]
@@ -587,8 +590,12 @@ class LabelSmoothingCrossEntropy(torch.nn.Module):
         log_probs = F.log_softmax(logits, dim=-1)
         
         # Validate target values are within valid range
-        assert target.max() < num_classes, f"Target contains invalid class index: {target.max()} >= {num_classes}"
-        assert target.min() >= 0, f"Target contains negative class index: {target.min()}"
+        max_target = target.max().item()
+        min_target = target.min().item()
+        if max_target >= num_classes:
+            raise ValueError(f"Target contains invalid class index: {max_target} >= {num_classes}")
+        if min_target < 0:
+            raise ValueError(f"Target contains negative class index: {min_target}")
         
         # Apply smoothing
         with torch.no_grad():
@@ -925,6 +932,9 @@ def main():
     GAZE_WEIGHT = 0.1  # Weight for gaze attention loss
     GAZE_LOSS_TYPE = 'mse'  # Type of gaze loss: 'mse', 'weighted_mse', 'cosine', 'kl'
     
+    # Diagnostic configuration
+    DIAGNOSTIC_FREQUENCY = 10  # Run full diagnostic analysis every N epochs (0 to disable)
+    
     # ========================================================================
     
     hyps = def_hyp(batch_size=BATCH_SIZE, epochs=EPOCHS, lr=LEARNING_RATE, accum_iter=ACCUM_ITER)
@@ -1111,8 +1121,8 @@ def main():
             print(f"{'='*80}")
             break
 
-        # Diagnostic analyze predictions periodically (every 10 epochs to reduce overhead)
-        if ev_acc == 0 or (epoch+1) % 10 == 0:
+        # Diagnostic analyze predictions periodically (configurable frequency)
+        if DIAGNOSTIC_FREQUENCY > 0 and (ev_acc == 0 or (epoch+1) % DIAGNOSTIC_FREQUENCY == 0):
             DataDebugger.analyze_model_predictions(model, eval_loader, device, f"Epoch {epoch+1} analysis")
         
         print(f"{'='*80}\n")
