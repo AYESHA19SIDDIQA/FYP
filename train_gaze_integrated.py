@@ -13,11 +13,11 @@ class GazeGuidedLoss(nn.Module):
     Loss function for gaze-guided training
     Combines classification loss with gaze alignment loss
     """
-    def __init__(self, cls_weight=1.0, gaze_weight=0.3):
+    def __init__(self, cls_weight=1.0, gaze_weight=0.3, class_weights=None):
         super(GazeGuidedLoss, self).__init__()
         self.cls_weight = cls_weight
         self.gaze_weight = gaze_weight
-        self.ce_loss = nn.CrossEntropyLoss()
+        self.ce_loss = nn.CrossEntropyLoss(weight=class_weights)
     
     def _gaze_alignment_loss(self, model_cam, gaze_map, label):
         """
@@ -93,14 +93,14 @@ class GazeGuidedLoss(nn.Module):
 def train_gaze_guided_your_pipeline(model, train_loader, eval_loader, optimizer, criterion, 
                                    epochs, history, metrics, device, save_path, earlystopping,
                                    accum_iter=1, scheduler=None, save_best_acc=False,
-                                   gaze_weight=0.3):
+                                   gaze_weight=0.3, class_weights=None):
     """
     Modified version of your train() function that includes gaze guidance
     """
     model = model.to(device)
     
     # Create gaze-guided loss
-    gaze_criterion = GazeGuidedLoss(cls_weight=1.0, gaze_weight=gaze_weight)
+    gaze_criterion = GazeGuidedLoss(cls_weight=1.0, gaze_weight=gaze_weight, class_weights=class_weights)
     
     for epoch in range(epochs):
         model.train()
