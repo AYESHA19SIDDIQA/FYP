@@ -448,6 +448,47 @@ def get_dataloaders_fixed(datadir, batch_size, seed,
 # ----------------- Training utilities -----------------
 
 
+def compute_class_weights(labels, device='cpu'):
+    """
+    Compute class weights for handling class imbalance.
+    Classes with fewer samples will get higher weights.
+    
+    Args:
+        labels (array-like): All training labels (list, numpy array, or tensor)
+        device (str): Device to place the weights tensor on ('cpu' or 'cuda')
+    
+    Returns:
+        torch.Tensor: Class weights tensor of shape [max_class_label + 1].
+    """
+    # Convert to numpy array if needed
+    if isinstance(labels, torch.Tensor):
+        labels = labels.cpu().numpy()
+    elif isinstance(labels, list):
+        labels = np.array(labels)
+    
+    # Get unique classes and their counts
+    classes, counts = np.unique(labels, return_counts=True)
+    
+    # Compute weights: inversely proportional to class frequency
+    # Formula matches sklearn's compute_class_weight with mode='balanced':
+    # weight[i] = total_samples / (num_classes * class_count[i])
+    total_samples = len(labels)
+    num_classes = len(classes)
+    weights = total_samples / (num_classes * counts)
+    
+    # Normalize weights to sum to num_classes
+    # This maintains relative class importance while keeping loss scale stable
+    weights = weights * (num_classes / weights.sum())
+    
+    # Create tensor with weights in proper class order
+    max_class = int(classes.max())
+    class_weights = torch.ones(max_class + 1, dtype=torch.float32)
+    for idx, cls in enumerate(classes):
+        class_weights[int(cls)] = weights[idx]
+    
+    return class_weights.to(device)
+
+
 def compute_gaze_attention_loss(attention_map, gaze, labels, loss_type='mse'):
     if loss_type == 'mse':
         return F.mse_loss(attention_map, gaze)
@@ -466,11 +507,15 @@ def compute_gaze_attention_loss(attention_map, gaze, labels, loss_type='mse'):
         raise ValueError("Unknown gaze loss type")
 
 
-def train_epoch_with_gaze(model, train_loader, optimizer, device, gaze_weight=0.1, gaze_loss_type='mse'):
+def train_epoch_with_gaze(model, train_loader, optimizer, device, gaze_weight=0.1, gaze_loss_type='mse', class_weights=None):
     model.train()
     total_loss = total_cls = total_gaze = 0.0
     correct = total = 0
     batches_with_gaze = samples_with_gaze = 0
+    
+    # Move class_weights to device if provided
+    if class_weights is not None:
+        class_weights = class_weights.to(device)
 
     pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc="Training")
     for batch_idx, batch in pbar:
@@ -514,7 +559,11 @@ def train_epoch_with_gaze(model, train_loader, optimizer, device, gaze_weight=0.
             logits = model(eeg, return_attention=False)
             attention_map = None
 
-        cls_loss = F.cross_entropy(logits, labels)
+        # classification loss with class weights
+        if class_weights is not None:
+            cls_loss = F.cross_entropy(logits, labels, weight=class_weights)
+        else:
+            cls_loss = F.cross_entropy(logits, labels)
         if has_gaze and attention_map is not None:
             gaze_loss = compute_gaze_attention_loss(attention_map, gaze, labels, gaze_loss_type)
             loss = cls_loss + gaze_weight * gaze_loss
@@ -636,6 +685,15 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=hyps['lr'])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=2, factor=0.1)
 
+    # Compute class weights for handling class imbalance
+    print("\nComputing class weights from training data...")
+    all_train_labels = []
+    for batch in train_loader:
+        all_train_labels.extend(batch['label'].numpy().tolist())
+    class_weights = compute_class_weights(all_train_labels, device=str(device))
+    print(f"Class weights computed: {class_weights}")
+    print(f"Label distribution: {dict(Counter(all_train_labels))}")
+
     # Quick check forward
     try:
         sample_batch = next(iter(train_loader))
@@ -656,7 +714,7 @@ def main():
     for epoch in range(hyps['epochs']):
         DataDebugger.print_header(f"EPOCH {epoch+1}/{hyps['epochs']}", width=60, char='-')
         tr_loss, tr_cls, tr_gaze, tr_acc, tr_stats = train_epoch_with_gaze(
-            model, train_loader, optimizer, device, gaze_weight=0.1, gaze_loss_type='mse'
+            model, train_loader, optimizer, device, gaze_weight=0.1, gaze_loss_type='mse', class_weights=class_weights
         )
         ev_acc, ev_labels, ev_preds = evaluate_model(model, eval_loader, device)
         scheduler.step(ev_acc)
