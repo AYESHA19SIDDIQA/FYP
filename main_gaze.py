@@ -416,8 +416,8 @@ def create_balanced_sampler(dataset, batch_size, minority_per_batch=2):
     print(f"\n  Balanced Sampler Statistics:")
     print(f"    Class counts: {class_counts}")
     print(f"    Class weights: {class_weights}")
-    print(f"    Target minority samples per batch: {minority_per_batch}")
-    print(f"    Expected minority ratio: {minority_per_batch / batch_size:.2%}")
+    print(f"    Note: WeightedRandomSampler uses probabilistic sampling")
+    print(f"    Expected increase in minority samples per batch (not guaranteed)")
     
     return sampler
 
@@ -585,6 +585,10 @@ class LabelSmoothingCrossEntropy(torch.nn.Module):
         """
         num_classes = logits.size(-1)
         log_probs = F.log_softmax(logits, dim=-1)
+        
+        # Validate target values are within valid range
+        assert target.max() < num_classes, f"Target contains invalid class index: {target.max()} >= {num_classes}"
+        assert target.min() >= 0, f"Target contains negative class index: {target.min()}"
         
         # Apply smoothing
         with torch.no_grad():
@@ -893,18 +897,44 @@ def main():
         data_dir = "./preprocessed_data"
         data_description = {'channel_no': 22, 'sampling_rate': 100, 'time_span': 300}
 
+    # ========================================================================
+    # CONFIGURATION SECTION - Adjust these parameters for your dataset
+    # ========================================================================
+    
+    # Data configuration
     gaze_json_dir = "results/gaze"
     
     # Training hyperparameters optimized for class imbalance
     # Smaller learning rate for better minority class learning
-    hyps = def_hyp(batch_size=16, epochs=30, lr=5e-5, accum_iter=2)
+    BATCH_SIZE = 16
+    EPOCHS = 30
+    LEARNING_RATE = 5e-5
+    ACCUM_ITER = 2
     
     # Class imbalance handling configuration
-    use_balanced_sampling = True  # Batch balancing to ensure minority samples
-    minority_per_batch = 2  # Minimum minority samples per batch
-    use_label_smoothing = True  # Label smoothing for majority class
-    label_smoothing = 0.1  # Smoothing factor
-    use_macro_f1_stopping = True  # Use macro-F1 instead of accuracy for early stopping
+    USE_BALANCED_SAMPLING = True  # Batch balancing with WeightedRandomSampler
+    MINORITY_PER_BATCH = 2  # Target minority samples per batch (guidance, not guaranteed)
+    USE_LABEL_SMOOTHING = True  # Label smoothing for majority class
+    LABEL_SMOOTHING = 0.1  # Smoothing factor (0.0 = none, 0.5 = aggressive)
+    USE_MACRO_F1_STOPPING = True  # Use macro-F1 instead of accuracy for early stopping
+    EARLY_STOP_PATIENCE = 10  # Epochs to wait before early stopping
+    SCHEDULER_PATIENCE = 5  # Epochs to wait before reducing learning rate
+    SCHEDULER_FACTOR = 0.5  # Factor to reduce learning rate by
+    
+    # Gaze attention configuration
+    GAZE_WEIGHT = 0.1  # Weight for gaze attention loss
+    GAZE_LOSS_TYPE = 'mse'  # Type of gaze loss: 'mse', 'weighted_mse', 'cosine', 'kl'
+    
+    # ========================================================================
+    
+    hyps = def_hyp(batch_size=BATCH_SIZE, epochs=EPOCHS, lr=LEARNING_RATE, accum_iter=ACCUM_ITER)
+    
+    # Use configuration variables
+    use_balanced_sampling = USE_BALANCED_SAMPLING
+    minority_per_batch = MINORITY_PER_BATCH
+    use_label_smoothing = USE_LABEL_SMOOTHING
+    label_smoothing = LABEL_SMOOTHING
+    use_macro_f1_stopping = USE_MACRO_F1_STOPPING
 
     # Build dataloaders (fixed)
     try:
@@ -942,7 +972,7 @@ def main():
     # Scheduler with longer patience for minority class learning
     # Mode 'max' because we're tracking macro-F1 or accuracy (higher is better)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', patience=5, factor=0.5, verbose=True
+        optimizer, mode='max', patience=SCHEDULER_PATIENCE, factor=SCHEDULER_FACTOR, verbose=True
     )
 
     # Compute class weights for handling class imbalance
@@ -971,7 +1001,7 @@ def main():
     best_metric = 0.0  # Will track either accuracy or macro-F1
     best_acc = 0.0
     patience_counter = 0
-    early_stop_patience = 10  # Stop if no improvement for 10 epochs
+    early_stop_patience = EARLY_STOP_PATIENCE  # Stop if no improvement for N epochs
     
     history = {
         'train_loss': [], 'train_acc': [], 'train_macro_f1': [],
@@ -998,7 +1028,7 @@ def main():
         # Train with all improvements
         tr_loss, tr_cls, tr_gaze, tr_acc, tr_stats, tr_metrics = train_epoch_with_gaze(
             model, train_loader, optimizer, device, 
-            gaze_weight=0.1, gaze_loss_type='mse', 
+            gaze_weight=GAZE_WEIGHT, gaze_loss_type=GAZE_LOSS_TYPE, 
             class_weights=class_weights,
             label_smoothing=label_smoothing,
             use_label_smoothing=use_label_smoothing
@@ -1081,8 +1111,8 @@ def main():
             print(f"{'='*80}")
             break
 
-        # Diagnostic analyze predictions periodically
-        if ev_acc == 0 or (epoch+1) % 5 == 0:
+        # Diagnostic analyze predictions periodically (every 10 epochs to reduce overhead)
+        if ev_acc == 0 or (epoch+1) % 10 == 0:
             DataDebugger.analyze_model_predictions(model, eval_loader, device, f"Epoch {epoch+1} analysis")
         
         print(f"{'='*80}\n")
