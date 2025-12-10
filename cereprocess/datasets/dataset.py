@@ -8,7 +8,7 @@ import pandas as pd
 from tqdm.notebook import tqdm
 import os
 from .getfiles import get_files
-from .pipeline import Pipeline, MultiPipeline
+from .pipeline import Pipeline, MultiPipeline, CropData, PaddedCropData
 from datetime import datetime
 
 
@@ -188,6 +188,7 @@ class Dataset:
             for i, pipeline in enumerate(self.pipeline):
                 try:
                     # Check if the pipeline has a defined time_span (from CropData/PaddedCropData)
+                    # Note: time_span is -1 by default when no CropData is present
                     if pipeline.time_span != -1:
                         time_span = pipeline.time_span
                         
@@ -211,7 +212,7 @@ class Dataset:
                             
                             # Apply the rest of the pipeline (excluding CropData/PaddedCropData)
                             for func in pipeline.pipeline:
-                                if func.__class__.__name__ not in ['CropData', 'PaddedCropData']:
+                                if not isinstance(func, (CropData, PaddedCropData)):
                                     segment_data = func.func(segment_data)
                             
                             processed_data = np.array(segment_data.get_data())
