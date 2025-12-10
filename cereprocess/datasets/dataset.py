@@ -187,14 +187,51 @@ class Dataset:
             # ---- PIPELINE BLOCK ----
             for i, pipeline in enumerate(self.pipeline):
                 try:
-                    appendname = f"_P{i}"
-                    processed_data = pipeline.apply(data)
-                    processed_data = np.array(processed_data.get_data())
+                    # Check if the pipeline has a defined time_span (from CropData/PaddedCropData)
+                    if pipeline.time_span != -1:
+                        time_span = pipeline.time_span
+                        
+                        # Calculate how many complete segments we can create
+                        num_segments = int(duration // time_span)
+                        
+                        # If no complete segments, skip this file
+                        if num_segments == 0:
+                            print(f"\nSkipping {file}: duration {duration}s < time_span {time_span}s")
+                            continue
+                        
+                        # Process each segment
+                        for segment_idx in range(num_segments):
+                            # Calculate start and end times for this segment
+                            start_time = segment_idx * time_span
+                            end_time = start_time + time_span
+                            
+                            # Create a copy of the data for this segment
+                            segment_data = data.copy()
+                            segment_data.crop(tmin=start_time, tmax=end_time, include_tmax=False)
+                            
+                            # Apply the rest of the pipeline (excluding CropData/PaddedCropData)
+                            for func in pipeline.pipeline:
+                                if func.__class__.__name__ not in ['CropData', 'PaddedCropData']:
+                                    segment_data = func.func(segment_data)
+                            
+                            processed_data = np.array(segment_data.get_data())
+                            
+                            # Create filename with segment index
+                            appendname = f"_P{i}_S{segment_idx}"
+                            filename = f"{os.path.splitext(os.path.basename(file))[0]}{appendname}.npz"
+                            np.savez(os.path.join(destdir, filename), data=processed_data, label=np.array(label))
+                            
+                            records.append({'File': os.path.join(destdir, filename), 'Label': label_index})
+                    else:
+                        # No time_span defined, process the whole file as before
+                        appendname = f"_P{i}"
+                        processed_data = pipeline.apply(data)
+                        processed_data = np.array(processed_data.get_data())
 
-                    filename = f"{os.path.splitext(os.path.basename(file))[0]}{appendname}.npz"
-                    np.savez(os.path.join(destdir, filename), data=processed_data, label=np.array(label))
+                        filename = f"{os.path.splitext(os.path.basename(file))[0]}{appendname}.npz"
+                        np.savez(os.path.join(destdir, filename), data=processed_data, label=np.array(label))
 
-                    records.append({'File': os.path.join(destdir, filename), 'Label': label_index})
+                        records.append({'File': os.path.join(destdir, filename), 'Label': label_index})
 
                 except Exception as e:
                     print("\n[ERROR in pipeline processing]")
