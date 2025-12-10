@@ -15,6 +15,9 @@ from datetime import datetime
 import traceback
 
 
+# Constant for normal file processing duration (5 minutes in seconds)
+NORMAL_FILE_DURATION_SECONDS = 300
+
 
 """
     V2: Important changes in term of modularity to the dataset class.
@@ -194,10 +197,10 @@ class Dataset:
                         
                         # For normal files (label_index == 0), only keep first 5 minutes
                         if label_index == 0:
-                            # Crop to first 5 minutes (300 seconds)
+                            # Crop to first 5 minutes
                             first_5min_data = data.copy()
                             # Crop to the minimum of file duration and 5 minutes
-                            crop_time = min(duration, 300)
+                            crop_time = min(duration, NORMAL_FILE_DURATION_SECONDS)
                             first_5min_data.crop(tmin=0, tmax=crop_time, include_tmax=False)
                             
                             # Apply the rest of the pipeline (excluding CropData/PaddedCropData)
