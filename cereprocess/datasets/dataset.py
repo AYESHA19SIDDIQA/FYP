@@ -15,8 +15,9 @@ from datetime import datetime
 import traceback
 
 
-# Constant for normal file processing duration (5 minutes in seconds)
-NORMAL_FILE_DURATION_SECONDS = 300
+# Constants for file processing durations (in seconds)
+NORMAL_FILE_DURATION_SECONDS = 300  # 5 minutes
+MINIMUM_FILE_DURATION_SECONDS = 1
 
 
 """
@@ -197,8 +198,8 @@ class Dataset:
                         
                         # For normal files (label_index == 0), only keep first 5 minutes
                         if label_index == 0:
-                            # Skip files that are too short (less than 1 second)
-                            if duration < 1:
+                            # Skip files that are too short
+                            if duration < MINIMUM_FILE_DURATION_SECONDS:
                                 print(f"\nSkipping {file}: duration {duration}s is too short")
                                 continue
                             
