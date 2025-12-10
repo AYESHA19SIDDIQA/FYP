@@ -15,6 +15,10 @@ from datetime import datetime
 import traceback
 
 
+# Constants for file processing durations (in seconds)
+NORMAL_FILE_DURATION_SECONDS = 300  # 5 minutes
+MINIMUM_FILE_DURATION_SECONDS = 1
+
 
 """
     V2: Important changes in term of modularity to the dataset class.
@@ -192,37 +196,65 @@ class Dataset:
                     if pipeline.time_span != -1:
                         time_span = pipeline.time_span
                         
-                        # Calculate how many complete segments we can create
-                        num_segments = int(duration // time_span)
-                        
-                        # If no complete segments, skip this file
-                        if num_segments == 0:
-                            print(f"\nSkipping {file}: duration {duration}s < time_span {time_span}s")
-                            continue
-                        
-                        # Process each segment
-                        for segment_idx in range(num_segments):
-                            # Calculate start and end times for this segment
-                            start_time = segment_idx * time_span
-                            end_time = start_time + time_span
+                        # For normal files (label_index == 0), only keep first 5 minutes
+                        if label_index == 0:
+                            # Skip files that are too short
+                            if duration < MINIMUM_FILE_DURATION_SECONDS:
+                                print(f"\nSkipping {file}: duration {duration}s is too short")
+                                continue
                             
-                            # Create a copy of the data for this segment
-                            segment_data = data.copy()
-                            segment_data.crop(tmin=start_time, tmax=end_time, include_tmax=False)
+                            # Crop to first 5 minutes
+                            first_5min_data = data.copy()
+                            # Crop to the minimum of file duration and 5 minutes
+                            crop_time = min(duration, NORMAL_FILE_DURATION_SECONDS)
+                            first_5min_data.crop(tmin=0, tmax=crop_time, include_tmax=False)
                             
                             # Apply the rest of the pipeline (excluding CropData/PaddedCropData)
                             for func in pipeline.pipeline:
                                 if not isinstance(func, (CropData, PaddedCropData)):
-                                    segment_data = func.func(segment_data)
+                                    first_5min_data = func.func(first_5min_data)
                             
-                            processed_data = np.array(segment_data.get_data())
+                            processed_data = np.array(first_5min_data.get_data())
                             
-                            # Create filename with segment index
-                            appendname = f"_P{i}_S{segment_idx}"
+                            # Create filename without segment index for normal files
+                            appendname = f"_P{i}"
                             filename = f"{os.path.splitext(os.path.basename(file))[0]}{appendname}.npz"
                             np.savez(os.path.join(destdir, filename), data=processed_data, label=np.array(label))
                             
                             records.append({'File': os.path.join(destdir, filename), 'Label': label_index})
+                        else:
+                            # For abnormal files (label_index == 1), create segments
+                            # Calculate how many complete segments we can create
+                            num_segments = int(duration // time_span)
+                            
+                            # If no complete segments, skip this file
+                            if num_segments == 0:
+                                print(f"\nSkipping {file}: duration {duration}s < time_span {time_span}s")
+                                continue
+                            
+                            # Process each segment
+                            for segment_idx in range(num_segments):
+                                # Calculate start and end times for this segment
+                                start_time = segment_idx * time_span
+                                end_time = start_time + time_span
+                                
+                                # Create a copy of the data for this segment
+                                segment_data = data.copy()
+                                segment_data.crop(tmin=start_time, tmax=end_time, include_tmax=False)
+                                
+                                # Apply the rest of the pipeline (excluding CropData/PaddedCropData)
+                                for func in pipeline.pipeline:
+                                    if not isinstance(func, (CropData, PaddedCropData)):
+                                        segment_data = func.func(segment_data)
+                                
+                                processed_data = np.array(segment_data.get_data())
+                                
+                                # Create filename with segment index
+                                appendname = f"_P{i}_S{segment_idx}"
+                                filename = f"{os.path.splitext(os.path.basename(file))[0]}{appendname}.npz"
+                                np.savez(os.path.join(destdir, filename), data=processed_data, label=np.array(label))
+                                
+                                records.append({'File': os.path.join(destdir, filename), 'Label': label_index})
                     else:
                         # No time_span defined, process the whole file as before
                         appendname = f"_P{i}"
