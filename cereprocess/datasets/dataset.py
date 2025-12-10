@@ -197,6 +197,11 @@ class Dataset:
                         
                         # For normal files (label_index == 0), only keep first 5 minutes
                         if label_index == 0:
+                            # Skip files that are too short (less than 1 second)
+                            if duration < 1:
+                                print(f"\nSkipping {file}: duration {duration}s is too short")
+                                continue
+                            
                             # Crop to first 5 minutes
                             first_5min_data = data.copy()
                             # Crop to the minimum of file duration and 5 minutes
